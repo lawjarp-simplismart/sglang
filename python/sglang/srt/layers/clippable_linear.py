@@ -216,7 +216,14 @@ class ClippableGLUParallelLinear(nn.Module):
             orig_loader(param, loaded_weight[:half], 0)
             orig_loader(param, loaded_weight[half:], 1)
 
-        self.linear.weight.weight_loader = _fused_weight_loader
+        try:
+            self.linear.weight.weight_loader = _fused_weight_loader
+        except AttributeError:
+            # ModelWeightParameter (FP8/quantized) defines weight_loader as a
+            # read-only @property. Write to the backing field directly so the
+            # fused loader is still used when loading FP8 Gemma 4 multimodal
+            # tower weights (audio + vision). See Apna/Simplismart benchmarks.
+            object.__setattr__(self.linear.weight, "_weight_loader", _fused_weight_loader)
 
         self.input_min = nn.parameter.Buffer(torch.tensor(-_INF), persistent=False)
         self.input_max = nn.parameter.Buffer(torch.tensor(_INF), persistent=False)
