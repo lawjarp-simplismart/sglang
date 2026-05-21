@@ -2222,14 +2222,26 @@ class ServerArgs:
                     self.attention_backend = default_attention_backend
 
             prefill_backend, decode_backend = self.get_attention_backends()
-            accepted_backends = ("trtllm_mha", "triton")
+            # fa4 is opt-in (never the default): on Hopper (SM90) the FA4 SM90
+            # kernel supports Gemma4's head_dim=256 + sliding window + softcap,
+            # but the Blackwell (SM100) hd256 2CTA kernel does not yet support
+            # softcap or local/sliding-window attention, so fa4 cannot serve
+            # Gemma4 there. Warn loudly if requested on SM100.
+            accepted_backends = ("trtllm_mha", "triton", "fa4")
             assert (
                 prefill_backend in accepted_backends
                 and decode_backend in accepted_backends
             ), (
-                "Gemma4 only supports trtllm_mha or triton attention backend, "
-                f"got prefill={prefill_backend}, decode={decode_backend}"
+                "Gemma4 only supports trtllm_mha, triton, or fa4 attention "
+                f"backend, got prefill={prefill_backend}, decode={decode_backend}"
             )
+            if "fa4" in (prefill_backend, decode_backend) and is_sm100_supported():
+                logger.warning(
+                    "fa4 attention backend for Gemma4 is only validated on "
+                    "Hopper (SM90); the FA4 head_dim=256 kernel on Blackwell "
+                    "(SM100) does not support softcap or sliding-window "
+                    "attention and will likely fail or be incorrect."
+                )
 
             if is_sm100_supported() and self.moe_runner_backend == "auto":
 
