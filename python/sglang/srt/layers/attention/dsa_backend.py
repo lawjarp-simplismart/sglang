@@ -675,6 +675,26 @@ class DeepseekSparseAttnBackend(
             f"Unsupported {self.dsa_topk_backend = } for SGLANG_DSA_FUSE_TOPK."
         )
 
+    def _translate_page_table_for_main_kv(
+        self, page_table_1: torch.Tensor
+    ) -> torch.Tensor:
+        translate_int32 = getattr(
+            self.token_to_kv_pool, "translate_loc_to_cp_shared_device_int32", None
+        )
+        if translate_int32 is not None:
+            return translate_int32(page_table_1)
+        translate = getattr(
+            self.token_to_kv_pool, "translate_loc_to_cp_shared_device", None
+        )
+        if translate is None:
+            return page_table_1
+        return translate(page_table_1).to(torch.int32)
+
+    def _synchronize_cp_shared_kv_write_before_read(self) -> None:
+        sync = getattr(self.token_to_kv_pool, "synchronize_cp_shared_kv_write", None)
+        if sync is not None:
+            sync()
+
     def get_device_int32_arange(self, length: int) -> torch.Tensor:
         if length > len(self._arange_buf):
             next_pow_of_2 = 1 << (length - 1).bit_length()
@@ -934,6 +954,10 @@ class DeepseekSparseAttnBackend(
                         f"Invalid page table index: max={max_idx}, "
                         f"kv_cache_capacity={kv_cache_capacity}"
                     )
+
+                page_table_1_flattened = self._translate_page_table_for_main_kv(
+                    page_table_1_flattened
+                )
 
             if topk_transform_method == TopkTransformMethod.RAGGED:
                 topk_indices_offset = torch.repeat_interleave(
@@ -1937,6 +1961,10 @@ class DeepseekSparseAttnBackend(
             page_table_1 = self.token_to_kv_pool.translate_loc_to_hisparse_device(
                 page_table_1
             ).to(torch.int32)
+        elif topk_transform_method != TopkTransformMethod.RAGGED:
+            page_table_1 = self._translate_page_table_for_main_kv(page_table_1)
+
+        self._synchronize_cp_shared_kv_write_before_read()
 
         if dsa_impl == "tilelang":
             if q_rope is not None:
@@ -2130,6 +2158,10 @@ class DeepseekSparseAttnBackend(
                 topk_indices=topk_indices,
                 page_size=1,
             )
+
+        page_table_1 = self._translate_page_table_for_main_kv(page_table_1)
+
+        self._synchronize_cp_shared_kv_write_before_read()
 
         if self.dsa_decode_impl == "flashmla_sparse":
             if q_rope is not None:
@@ -2694,6 +2726,9 @@ class DeepseekSparseAttnBackend(
                 topk_indices=topk_indices,
                 page_size=1,
             )
+        page_table_1 = self._translate_page_table_for_main_kv(page_table_1)
+
+        self._synchronize_cp_shared_kv_write_before_read()
 
         q_scale = 1.0
         k_scale = (
