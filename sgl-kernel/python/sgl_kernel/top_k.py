@@ -2,6 +2,19 @@ from typing import Optional
 
 import torch
 
+# Top-k widths the fused DSA top-k CUDA kernels are instantiated for. Must stay in sync
+# with SGL_DISPATCH_TOPK in sgl-kernel/csrc/elementwise/topk.cu.
+#   2048 -> DeepSeek-V3.2
+#   1024 -> GLM-5.2 (index_topk=1024)
+SUPPORTED_FUSED_TOPK = (1024, 2048)
+
+
+def _check_supported_topk(topk: int, fn_name: str) -> None:
+    assert topk in SUPPORTED_FUSED_TOPK, (
+        f"{fn_name}: the fused DSA top-k kernel is only compiled for "
+        f"topk in {SUPPORTED_FUSED_TOPK}, got topk={topk}"
+    )
+
 
 def fast_topk(values, topk, dim):
     if topk == 1:
@@ -33,9 +46,7 @@ def fast_topk_v2(
     Returns:
         The topk indices tensor of shape (B, topk)
     """
-    assert (
-        topk == 2048
-    ), "fast_topk_v2 is only optimized for deepseek v3.2 model, where topk=2048"
+    _check_supported_topk(topk, "fast_topk_v2")
     assert score.dim() == 2
     topk_indices = score.new_empty((score.size(0), topk), dtype=torch.int32)
     torch.ops.sgl_kernel.fast_topk(score, topk_indices, lengths, row_starts)
@@ -68,9 +79,7 @@ def fast_topk_transform_fused(
     Returns:
         The topk indices tensor of shape (B, topk)
     """
-    assert (
-        topk == 2048
-    ), "fast_topk_transform_fused is only optimized for deepseek v3.2 model, where topk=2048"
+    _check_supported_topk(topk, "fast_topk_transform_fused")
     assert score.dim() == 2
     src_page_table = page_table_size_1
     dst_page_table = score.new_empty((score.shape[0], topk), dtype=torch.int32)
@@ -138,9 +147,7 @@ def fast_topk_transform_ragged_fused(
     Returns:
         The topk indices tensor of shape (B, topk)
     """
-    assert (
-        topk == 2048
-    ), "fast_topk_transform_ragged_fused is only optimized for deepseek v3.2 model, where topk=2048"
+    _check_supported_topk(topk, "fast_topk_transform_ragged_fused")
     assert score.dim() == 2
     topk_indices_ragged = score.new_empty((score.shape[0], topk), dtype=torch.int32)
     torch.ops.sgl_kernel.fast_topk_transform_ragged_fused(
