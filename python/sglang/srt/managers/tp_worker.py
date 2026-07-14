@@ -340,10 +340,7 @@ class TpModelWorker(BaseTpWorker):
 
         # Validation
         assert self.model_runner.max_running_requests > 0, "max_running_request is zero"
-        max_req_len = min(
-            self.model_config.context_len - 1,
-            self.model_runner.max_token_pool_size - 1,
-        )
+        max_req_len = self._compute_max_req_len()
         assert max_req_len > 0, "Memory pool size is too small"
 
     def init_attention_backends(self):
@@ -451,11 +448,20 @@ class TpModelWorker(BaseTpWorker):
     def register_hisparse_coordinator(self, coordinator):
         self.model_runner.hisparse_coordinator = coordinator
 
+    def _compute_max_req_len(self) -> int:
+        context_cap = self.model_config.context_len - 1
+        # Host-tiered KV (HiCache / HiSparse) spills cold pages off GPU, so a
+        # single request may exceed the device pool as long as it fits in
+        # context_len and the host/storage tiers.
+        if (
+            self.server_args.enable_hierarchical_cache
+            or self.server_args.enable_hisparse
+        ):
+            return context_cap
+        return min(context_cap, self.model_runner.max_token_pool_size - 1)
+
     def get_worker_info(self):
-        max_req_len = min(
-            self.model_config.context_len - 1,
-            self.model_runner.max_token_pool_size - 1,
-        )
+        max_req_len = self._compute_max_req_len()
         return (
             self.model_runner.max_total_num_tokens,
             self.server_args.max_prefill_tokens,
