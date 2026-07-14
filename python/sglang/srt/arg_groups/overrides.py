@@ -1239,8 +1239,16 @@ def _dsa_split_backend_resolution(view: Any) -> dict:
         declared["dsa_prefill_backend"] = "tilelang"
         declared["dsa_decode_backend"] = "tilelang"
     elif kv_cache_dtype == "fp8_e4m3":
-        # Blackwell FP8 defaults to trtllm; Hopper FP8 to flashmla_kv.
-        default = "trtllm" if major >= 10 else "flashmla_kv"
+        # SM120 (RTX PRO 6000 / consumer Blackwell): use flashmla_kv so the
+        # pool keeps the packed 656-byte GLM FP8 KV layout, then route the
+        # actual kernel to FlashInfer sparse MLA (see _forward_flashmla_kv).
+        # SM100+ datacenter Blackwell keeps trtllm; Hopper FP8 uses flashmla_kv.
+        if is_sm120_supported():
+            default = "flashmla_kv"
+        elif major >= 10:
+            default = "trtllm"
+        else:
+            default = "flashmla_kv"
         if not user_set_prefill:
             declared["dsa_prefill_backend"] = default
         if not user_set_decode:
@@ -1250,7 +1258,12 @@ def _dsa_split_backend_resolution(view: Any) -> dict:
         if not user_set_prefill:
             declared["dsa_prefill_backend"] = "flashmla_sparse"
         if not user_set_decode:
-            declared["dsa_decode_backend"] = "trtllm" if major >= 10 else "fa3"
+            if is_sm120_supported():
+                declared["dsa_decode_backend"] = "flashmla_kv"
+            elif major >= 10:
+                declared["dsa_decode_backend"] = "trtllm"
+            else:
+                declared["dsa_decode_backend"] = "fa3"
 
     prefill = declared.get("dsa_prefill_backend", view.dsa_prefill_backend)
     decode = declared.get("dsa_decode_backend", view.dsa_decode_backend)

@@ -64,6 +64,7 @@ from sglang.srt.utils import (
     is_gfx95_supported,
     is_hip,
     is_sm100_supported,
+    is_sm120_supported,
     print_warning_once,
 )
 
@@ -761,6 +762,9 @@ class DeepseekSparseAttnBackend(
             else self.dsa_prefill_impl
         )
         use_flashmla_kv = (not self.use_mha) and dsa_impl_for_batch == "flashmla_kv"
+        # SM120 sparse MLA goes through FlashInfer and does not need sgl_kernel
+        # FlashMLA schedule metadata (which is SM90/SM100-oriented).
+        need_flashmla_metadata = use_flashmla_kv and self._needs_sgl_flashmla_metadata()
         topk_transform_method = self.get_topk_transform_method(
             forward_batch.forward_mode
         )
@@ -992,7 +996,7 @@ class DeepseekSparseAttnBackend(
                     cache_seqlens=dsa_cache_seqlens_int32,
                     seq_len_q=1,
                 )
-                if use_flashmla_kv
+                if need_flashmla_metadata
                 else None
             ),
             paged_mqa_schedule_metadata=paged_mqa_schedule_metadata,
@@ -1167,7 +1171,7 @@ class DeepseekSparseAttnBackend(
                     ),
                     seq_len_q=1,
                 )
-                if self.dsa_decode_impl == "flashmla_kv"
+                if self._needs_sgl_flashmla_metadata()
                 else None
             ),
         }
@@ -1214,7 +1218,7 @@ class DeepseekSparseAttnBackend(
 
             seqlens_expanded = cache_seqlens_int32
             dsa_extend_seq_lens_list = [1] * bs
-            if self.dsa_decode_impl == "flashmla_kv":
+            if self._needs_sgl_flashmla_metadata():
                 flashmla_metadata = self.decode_cuda_graph_metadata[
                     "flashmla_metadata"
                 ].slice(slice(0, bs + 1))
@@ -1276,7 +1280,7 @@ class DeepseekSparseAttnBackend(
             )
             dsa_extend_seq_lens_list = [1] * bs * self.speculative_num_draft_tokens
 
-            if self.dsa_decode_impl == "flashmla_kv":
+            if self._needs_sgl_flashmla_metadata():
                 flashmla_metadata = self.decode_cuda_graph_metadata[
                     "flashmla_metadata"
                 ].slice(slice(0, bs * self.speculative_num_draft_tokens + 1))
@@ -1630,7 +1634,7 @@ class DeepseekSparseAttnBackend(
         else:
             assert metadata.real_page_table is metadata.page_table_1
 
-        if self.dsa_decode_impl == "flashmla_kv":
+        if self._needs_sgl_flashmla_metadata():
             flashmla_metadata = metadata.flashmla_metadata.slice(
                 slice(0, seqlens_expanded_size + 1)
             )
@@ -2295,6 +2299,19 @@ class DeepseekSparseAttnBackend(
         metadata: DSAMetadata,
         page_table_1,
     ) -> torch.Tensor:
+        # SM120 (RTX PRO 6000): sgl_kernel FlashMLA has no FP8 DSA kernels;
+        # FlashInfer's packed sparse MLA consumes the 656-byte GLM layout.
+        if is_sm120_supported() and self.dsa_kv_cache_store_fp8:
+            return self._forward_flashinfer_sparse_mla_sm120(
+                q_all=q_all,
+                kv_cache=kv_cache,
+                v_head_dim=v_head_dim,
+                sm_scale=sm_scale,
+                layer=layer,
+                metadata=metadata,
+                page_table_1=page_table_1,
+            )
+
         from sgl_kernel.flash_mla import flash_mla_with_kvcache
 
         cache_seqlens = metadata.dsa_cache_seqlens_int32
@@ -2345,6 +2362,85 @@ class DeepseekSparseAttnBackend(
             o = o[:, :, :num_q_heads, :]
 
         return o
+
+    def _forward_flashinfer_sparse_mla_sm120(
+        self,
+        q_all: torch.Tensor,
+        kv_cache: torch.Tensor,
+        v_head_dim: int,
+        sm_scale: float,
+        layer,
+        metadata: DSAMetadata,
+        page_table_1,
+    ) -> torch.Tensor:
+        """GLM/DeepSeek DSA FP8 sparse MLA on SM120 via FlashInfer.
+
+        Contract (flashinfer>=0.6.14):
+          - BF16 query with head_dim == 576
+          - packed uint8 KV with 656 bytes/token (FP8 nope + FP32 scales + BF16 RoPE)
+          - backend=\"sparse\", kv_scale_format=\"arbitrary_fp32\"
+        """
+        import flashinfer.decode
+
+        assert q_all.dtype == torch.bfloat16, (
+            f"SM120 FlashInfer sparse MLA expects BF16 query, got {q_all.dtype}"
+        )
+        assert self.real_page_size == 64, "SM120 sparse MLA requires page_size=64"
+        assert self.kv_cache_dim == 656, (
+            f"SM120 sparse MLA expects packed 656-byte KV, got dim={self.kv_cache_dim}"
+        )
+        assert page_table_1.shape[-1] == self.dsa_index_topk
+
+        # [tokens, heads, 576] -> [tokens, 1, heads, 576] (q_len=1 per row)
+        q = q_all.view(-1, 1, layer.tp_q_head_num, layer.head_dim)
+        assert q.shape[-1] == 576, (
+            f"SM120 sparse MLA expects qk head_dim 576, got {q.shape[-1]}"
+        )
+
+        # FlashInfer accepts [pages, 1, page_size, 656] as packed uint8.
+        kv = kv_cache.view(-1, 1, self.real_page_size, self.kv_cache_dim)
+        if kv.dtype != torch.uint8:
+            kv = kv.view(torch.uint8)
+
+        block_tables = page_table_1.unsqueeze(1).to(torch.int32)
+        # Per-token rows use seq_len = topk candidates selected for that row.
+        # For true multi-token requests the indexer already expanded to one
+        # row per query token; FlashInfer SM120 sparse ignores dense cache lens.
+        seq_lens = metadata.cache_seqlens_int32
+        if seq_lens.shape[0] != q.shape[0]:
+            # Prefill/extend emit one page-table row per query token.
+            seq_lens = torch.full(
+                (q.shape[0],),
+                self.dsa_index_topk,
+                dtype=torch.int32,
+                device=q.device,
+            )
+
+        bmm1_scale = float(sm_scale)
+        if getattr(layer, "k_scale_float", None) is not None:
+            bmm1_scale = float(layer.k_scale_float) * bmm1_scale
+
+        out = flashinfer.decode.trtllm_batch_decode_with_kv_cache_mla(
+            query=q,
+            kv_cache=kv,
+            workspace_buffer=self.workspace_buffer,
+            qk_nope_head_dim=self.qk_nope_head_dim,
+            kv_lora_rank=self.kv_lora_rank,
+            qk_rope_head_dim=self.qk_rope_head_dim,
+            block_tables=block_tables,
+            seq_lens=seq_lens,
+            max_seq_len=metadata.max_seq_len_k,
+            sparse_mla_top_k=self.dsa_index_topk,
+            bmm1_scale=bmm1_scale,
+            bmm2_scale=1.0,
+            backend="sparse",
+            kv_scale_format="arbitrary_fp32",
+        )
+        # Match other DSA backends' output layout: [tokens, heads, v_dim]
+        if out.dim() == 4:
+            out = out.squeeze(1)
+        _ = v_head_dim
+        return out
 
     def _forward_standard_mha(
         self,
@@ -2618,6 +2714,17 @@ class DeepseekSparseAttnBackend(
         """Forward using TRT-LLM sparse MLA kernel."""
         import flashinfer.decode
 
+        # SM120 has no TRT-LLM-gen MLA kernels. Prefer the auto TileLang
+        # backends (see _dsa_split_backend_resolution); fail clearly if a
+        # user forced --dsa-*-backend trtllm on SM120.
+        if is_sm120_supported():
+            raise RuntimeError(
+                "DSA backend 'trtllm' is not supported on SM120 (RTX PRO 6000 / "
+                "consumer Blackwell). Use the default flashmla_kv path (FlashInfer "
+                "sparse MLA), or set "
+                "--dsa-prefill-backend flashmla_kv --dsa-decode-backend flashmla_kv."
+            )
+
         metadata = self.forward_metadata
 
         merge_query = q_rope is not None
@@ -2860,7 +2967,21 @@ class DeepseekSparseAttnBackend(
             force_unfused_topk=force_unfused,
         )
 
+    def _needs_sgl_flashmla_metadata(self) -> bool:
+        """Whether sgl_kernel FlashMLA schedule metadata is required.
+
+        SM120 FP8 DSA uses FlashInfer sparse MLA instead of sgl_kernel FlashMLA,
+        so the SM90/SM100 schedule tensors must not be built.
+        """
+        return self.dsa_decode_impl == "flashmla_kv" and not (
+            is_sm120_supported() and self.dsa_kv_cache_store_fp8
+        )
+
     def _compute_flashmla_metadata(self, cache_seqlens: torch.Tensor, seq_len_q: int):
+        assert self._needs_sgl_flashmla_metadata(), (
+            "sgl_kernel FlashMLA metadata is not used on SM120 FP8 DSA "
+            "(FlashInfer sparse MLA path)."
+        )
         from sgl_kernel.flash_mla import get_mla_metadata
 
         num_heads_q = self.flashmla_kv_num_q_heads

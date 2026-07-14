@@ -164,7 +164,7 @@ class DeepseekSparseAttnBackendMTPPrecomputeMixin:
             seqlens_expanded_size = bs
 
             flashmla_metadata = None
-            if self.dsa_decode_impl == "flashmla_kv":
+            if self._needs_sgl_flashmla_metadata():
                 flashmla_metadata = self._compute_flashmla_metadata(
                     cache_seqlens=dsa_cache_seqlens,
                     seq_len_q=1,
@@ -209,7 +209,7 @@ class DeepseekSparseAttnBackendMTPPrecomputeMixin:
 
         # Compute FlashMLA metadata if needed
         flashmla_metadata = None
-        if self.dsa_decode_impl == "flashmla_kv":
+        if self._needs_sgl_flashmla_metadata():
             flashmla_metadata = self._compute_flashmla_metadata(
                 cache_seqlens=dsa_cache_seqlens,
                 seq_len_q=1,
@@ -296,7 +296,7 @@ class DeepseekSparseAttnBackendMTPPrecomputeMixin:
             )
 
             flashmla_metadata = None
-            if self.dsa_decode_impl == "flashmla_kv":
+            if self._needs_sgl_flashmla_metadata():
                 flashmla_metadata = self._compute_flashmla_metadata(
                     cache_seqlens=dsa_cache_seqlens,
                     seq_len_q=1,
@@ -356,7 +356,7 @@ class DeepseekSparseAttnBackendMTPPrecomputeMixin:
 
         # FlashMLA metadata
         flashmla_metadata = None
-        if self.dsa_decode_impl == "flashmla_kv":
+        if self._needs_sgl_flashmla_metadata():
             flashmla_metadata = self._compute_flashmla_metadata(
                 cache_seqlens=dsa_cache_seqlens,
                 seq_len_q=1,
