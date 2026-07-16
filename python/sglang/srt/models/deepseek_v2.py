@@ -2702,6 +2702,18 @@ class DeepseekV2ForCausalLM(nn.Module, DeepseekV2WeightLoaderMixin):
                 "kv_a_proj_with_mqa",
             ]
 
+        # DeepseekV2MLP (dense layers and shared-experts) fuses gate_proj/up_proj
+        # into gate_up_proj, but checkpoints store them unfused. Quant configs like
+        # compressed-tensors (should_ignore_layer) and Quark rely on the model to
+        # provide this mapping so ignore-list exclusion checks can unfuse the
+        # derived name back to the checkpoint's source layer names -- without it,
+        # a mixed-precision checkpoint that leaves gate_proj/up_proj unquantized
+        # (e.g. GLM-5.2's dense layers 0-2 and every layer's shared_experts) gets
+        # gate_up_proj wrongly treated as quantized, building a packed weight
+        # (gate_up_proj.weight_packed) instead of the plain .weight the checkpoint
+        # actually has, which then KeyErrors in the weight loader.
+        self.packed_modules_mapping["gate_up_proj"] = ["gate_proj", "up_proj"]
+
         # Quant configs like Quark may rely on the model to provide fused-module
         # mappings so exclusion checks can unfuse derived names back to the
         # checkpoint's source layer names.
